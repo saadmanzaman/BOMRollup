@@ -28,6 +28,7 @@ INSERT INTO #Req (ParentPN, ChildPN, Cost)
 
 ----------------------------------
 --USE RECURSIVE LOOP TO ITERATE THROUGH PARENT/CHILD RELATIONSHIP; STORE INTO TABLE
+--Use CHECKSUM to create an INTEGERS; joining on INTEGERS is faster than joining on STRING
 
 DROP TABLE IF EXISTS #BOM
 GO
@@ -38,6 +39,7 @@ WITH bomcte AS(
         ,b.Cost
         ,0 AS Level
         ,b.ParentPN AS SourcePN
+        ,CHECKSUM(b.ParentPN) AS SourcePNID
         ,CAST(b.ParentPN AS NVARCHAR(MAX)) AS DemandBranch
         ,CHECKSUM(CAST(b.ParentPN AS NVARCHAR(MAX))) AS DemandBranchID
         ,NULL AS ParentBranchID
@@ -51,6 +53,7 @@ WITH bomcte AS(
         ,b.Cost
         ,bc.Level + 1 AS Level
         ,bc.SourcePN
+        ,bc.SourcePNID
         ,CAST(bc.DemandBranch AS NVARCHAR(MAX)) + ' > ' + CAST(b.ParentPN AS NVARCHAR(MAX)) AS DemandBranch
         ,CHECKSUM(CAST(bc.DemandBranch AS NVARCHAR(MAX)) + ' > ' + CAST(b.ParentPN AS NVARCHAR(MAX))) AS DemandBranchID
         ,bc.DemandBranchID AS ParentBranchID
@@ -63,13 +66,17 @@ SELECT *
   INTO #BOM
   FROM bomcte
  
+--  SELECT *
+--    FROM #BOM b
+
 ----------------------------------
 --CONDENSE DATA INTO UNIQUE P/N
 DROP TABLE IF EXISTS #BOMFlat;
-SELECT b.ParentPN      
+SELECT b.ParentPN
       ,SUM(b.Cost) AS Cost
       ,b.Level
       ,b.SourcePN
+      ,b.SourcePNID
       ,b.DemandBranch
       ,b.DemandBranchID
       ,b.ParentBranchID
@@ -78,32 +85,51 @@ SELECT b.ParentPN
   GROUP BY b.ParentPN      
       ,b.Level
       ,b.SourcePN
+      ,b.SourcePNID
       ,b.DemandBranch
       ,b.DemandBranchID
       ,b.ParentBranchID
   ORDER BY b.Level
 
-  SELECT * FROM #BOMFlat b
-    ORDER BY b.Level
+
 
 ----------------------------------
---Use While Loop to sum Costs
-
-  CREATE TABLE #Rollup (ParentPN NVARCHAR(20), ChildPN NVARCHAR(20), Cost DECIMAL(18,2))
+--Use While Loop to sum Costs, and store in Rollup temp table
+--Using CTE in this step prevents aggregation 
+DROP TABLE IF EXISTS #Rollup;
+CREATE TABLE #Rollup (DemandBranchID INT, ParentBranchID INT, Level SMALLINT, Cost DECIMAL(18,2), SourcePNID INT)
+CREATE NONCLUSTERED INDEX costrollup ON #Rollup(DemandBranchID, ParentBranchID, SourcePNID) --create non-clustered index to speed up JOINs 
 
 DECLARE @MaxL AS INT = (SELECT MAX(b.Level) FROM #BOMFlat b)
 DECLARE @Loop AS INT = @MaxL
 
 WHILE @Loop >= 0
   BEGIN
+    INSERT INTO #Rollup (DemandBranchID, ParentBranchID, Level, Cost, SourcePNID)
 
-  SELECT b.ParentPN
-         ,b.ChildPN
-        ,
-    FROM #BOMFlat b
-    WHERE b.Level = @Loop
+SELECT 
+  b.DemandBranchID
+  ,b.ParentBranchID
+  ,b.Level
+  ,SUM(b.Cost+ISNULL(r.Cost,0)) AS CostAgg
+  ,b.SourcePNID
+  FROM #BOMFlat b
+  LEFT JOIN #Rollup r
+    ON r.ParentBranchID = b.DemandBranchID
+    AND r.SourcePNID = b.SourcePNID --make sure you're looping in the same branch
+    AND r.Level = @Loop + 1
+  WHERE b.Level = @Loop
+  GROUP BY b.DemandBranchID
+  ,b.ParentBranchID
+  ,b.Level
+  ,b.SourcePNID
   
     SET @Loop = @Loop - 1
 
   END
 
+----------------------------------
+--Summarize Cost Data
+
+SELECT *
+FROM #Rollup r
